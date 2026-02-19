@@ -1,34 +1,73 @@
 #!/usr/bin/env bash
-# setup.sh — Download OIG exclusion list and prepare NPPES data
-# Memory-conscious: only downloads what's needed
-
+# setup.sh — Download data files for Medicaid Fraud Signal Detection Engine
+# Works on Ubuntu 22.04+ and macOS 14+ with Python 3.11+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/data"
 mkdir -p "${DATA_DIR}"
 
+# Find Python 3.11+
+PYTHON=""
+for p in python3 python3.12 python3.11; do
+    if command -v "$p" &>/dev/null; then
+        PYTHON="$p"
+        break
+    fi
+done
+if [ -z "${PYTHON}" ]; then
+    echo "ERROR: Python 3.11+ required but not found."
+    exit 1
+fi
+echo "Using Python: ${PYTHON} ($(${PYTHON} --version))"
+
+# Install dependencies
+echo "Installing Python dependencies..."
+${PYTHON} -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || \
+    ${PYTHON} -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet --break-system-packages 2>/dev/null || \
+    echo "WARNING: Could not install deps automatically. Install manually: pip install -r requirements.txt"
+
+echo ""
 echo "=== Medicaid Fraud Signal Detection Engine — Setup ==="
 echo "Data directory: ${DATA_DIR}"
 echo ""
 
-# ---- 1. Download OIG LEIE Exclusion List (small CSV, ~15MB) ----
+# ---- 1. Download OIG LEIE Exclusion List (~15MB CSV) ----
 OIG_CSV="${DATA_DIR}/UPDATED.csv"
 if [ -f "${OIG_CSV}" ]; then
     echo "[OIG] Exclusion list already downloaded: ${OIG_CSV}"
 else
     echo "[OIG] Downloading OIG LEIE Exclusion List..."
     curl -L -o "${OIG_CSV}" \
-        "https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv"
+        "https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv" \
+        --progress-bar
     echo "[OIG] Downloaded: $(wc -l < "${OIG_CSV}") lines"
 fi
 
-# ---- 2. NPPES NPI Registry ----
-# The full NPPES file is ~1GB zipped, ~8GB unzipped. Too large for our disk.
-# Strategy: Download the zip, extract only the main CSV, then use DuckDB
-# to read only the columns we need and create a small filtered parquet.
-# If disk is too tight, we fall back to the NPPES API for individual lookups.
+# ---- 2. Download Medicaid Provider Spending Parquet (~2.9GB) ----
+PARQUET="${DATA_DIR}/medicaid-provider-spending.parquet"
+if [ -f "${PARQUET}" ]; then
+    SIZE=$(stat -f%z "${PARQUET}" 2>/dev/null || stat -c%s "${PARQUET}" 2>/dev/null || echo "0")
+    if [ "${SIZE}" -gt 100000000 ]; then
+        SIZE_MB=$((SIZE / 1024 / 1024))
+        echo "[Parquet] Already downloaded: ${PARQUET} (${SIZE_MB} MB)"
+    else
+        echo "[Parquet] File too small, re-downloading..."
+        rm -f "${PARQUET}"
+    fi
+fi
+if [ ! -f "${PARQUET}" ]; then
+    echo "[Parquet] Downloading Medicaid provider spending data (~2.9GB)..."
+    echo "[Parquet] This may take 10-30 minutes depending on connection speed."
+    curl -L -o "${PARQUET}" \
+        "https://stopendataprod.blob.core.windows.net/datasets/medicaid-provider-spending/2026-02-09/medicaid-provider-spending.parquet" \
+        --progress-bar
+    SIZE=$(stat -f%z "${PARQUET}" 2>/dev/null || stat -c%s "${PARQUET}" 2>/dev/null || echo "0")
+    SIZE_MB=$((SIZE / 1024 / 1024))
+    echo "[Parquet] Downloaded: ${SIZE_MB} MB"
+fi
 
+# ---- 3. NPPES NPI Registry ----
 NPPES_DIR="${DATA_DIR}/nppes"
 NPPES_PARQUET="${NPPES_DIR}/nppes_slim.parquet"
 NPPES_ZIP="${NPPES_DIR}/nppes.zip"
@@ -38,13 +77,17 @@ if [ -f "${NPPES_PARQUET}" ]; then
 else
     mkdir -p "${NPPES_DIR}"
 
-    # Check available disk space (need ~2GB temporarily)
-    AVAIL_KB=$(df --output=avail "${DATA_DIR}" | tail -1 | tr -d ' ')
+    # Check available disk space (need ~10GB temporarily)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        AVAIL_KB=$(df -k "${DATA_DIR}" | tail -1 | awk '{print $4}')
+    else
+        AVAIL_KB=$(df --output=avail "${DATA_DIR}" | tail -1 | tr -d ' ')
+    fi
     AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
     echo "[NPPES] Available disk: ${AVAIL_GB}GB"
 
     if [ "${AVAIL_GB}" -lt 3 ]; then
-        echo "[NPPES] WARNING: Less than 3GB free. Will use NPPES API for lookups instead."
+        echo "[NPPES] WARNING: Less than 3GB free. Will use NPPES API for lookups."
         echo "api_fallback" > "${NPPES_DIR}/mode.txt"
     else
         echo "[NPPES] Downloading NPPES zip (~1GB)..."
@@ -53,26 +96,23 @@ else
             --progress-bar
 
         echo "[NPPES] Extracting main CSV from zip..."
-        # Find the main CSV filename inside the zip
-        MAIN_CSV=$(unzip -l "${NPPES_ZIP}" | grep -oP 'npidata_pfile_\d+-\d+\.csv' | head -1)
+        MAIN_CSV=$(unzip -l "${NPPES_ZIP}" 2>/dev/null | grep -oE 'npidata_pfile_[0-9]+-[0-9]+\.csv' | head -1 || true)
 
         if [ -z "${MAIN_CSV}" ]; then
-            echo "[NPPES] Could not find main CSV in zip. Listing contents:"
+            echo "[NPPES] Could not find main CSV in zip. Contents:"
             unzip -l "${NPPES_ZIP}" | head -20
             echo "[NPPES] Falling back to API mode."
             echo "api_fallback" > "${NPPES_DIR}/mode.txt"
             rm -f "${NPPES_ZIP}"
         else
-            echo "[NPPES] Found main CSV: ${MAIN_CSV}"
-            # Extract just that file
+            echo "[NPPES] Found: ${MAIN_CSV}"
             unzip -o -j "${NPPES_ZIP}" "${MAIN_CSV}" -d "${NPPES_DIR}/"
 
-            echo "[NPPES] Creating slim parquet with only needed columns..."
-            /opt/autonomous-ai/venv/bin/python3 -c "
+            echo "[NPPES] Creating slim parquet (only needed columns)..."
+            ${PYTHON} -c "
 import duckdb
 con = duckdb.connect()
 con.execute(\"SET memory_limit='1500MB'\")
-# Read only the columns we need from the large CSV
 con.execute(\"\"\"
     COPY (
         SELECT
@@ -107,7 +147,8 @@ fi
 
 echo ""
 echo "=== Setup Complete ==="
-echo "OIG CSV: $(ls -lh "${OIG_CSV}" 2>/dev/null || echo 'not found')"
-echo "NPPES:   $(cat "${NPPES_DIR}/mode.txt" 2>/dev/null || echo 'not configured')"
+echo "OIG CSV:  $(ls -lh "${OIG_CSV}" 2>/dev/null || echo 'not found')"
+echo "Parquet:  $(ls -lh "${PARQUET}" 2>/dev/null || echo 'not found')"
+echo "NPPES:    $(cat "${NPPES_DIR}/mode.txt" 2>/dev/null || echo 'not configured')"
 echo ""
-echo "Run detect_fraud.py to start analysis."
+echo "Run: bash run.sh"

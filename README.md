@@ -1,81 +1,174 @@
 # Medicaid Provider Fraud Signal Detection Engine
 
-A tool that analyzes 227 million rows of CMS Medicaid provider spending data to detect fraud signals. Cross-references billing data with the OIG LEIE exclusion list and NPPES NPI registry.
+A Python tool that analyzes 227 million rows of CMS Medicaid provider spending data (Jan 2018 – Dec 2024) to detect fraud signals. Cross-references billing data with the OIG LEIE exclusion list and NPPES NPI registry to identify providers with suspicious billing patterns.
 
-## Fraud Signals Detected
+## Fraud Signals Detected (9 total)
 
 | # | Signal | Severity | Description |
 |---|--------|----------|-------------|
-| 1 | Excluded Provider Billing | Critical | Providers on the OIG exclusion list still receiving Medicaid payments |
-| 2 | Statistical Billing Outliers | High | Providers billing >3 standard deviations above the mean |
-| 3 | Bust-Out Schemes | High | Recently enrolled providers with >500% billing ramp-up in 6 months |
-| 4 | Impossible Service Volume | High | Providers with >500 claims per beneficiary per month |
-| 5 | Home Health Billing Abuse | High | Home health providers with claims:beneficiary ratio >50:1 |
-| 6 | Shell Entity Networks | Medium | Authorized officials controlling 5+ NPIs |
+| 1 | Excluded Provider Billing | Critical | Providers on the OIG exclusion list still receiving Medicaid payments after their exclusion date |
+| 2 | Statistical Billing Outliers | High | Providers billing >3 standard deviations above the mean with robust statistics (median/IQR) |
+| 3 | Bust-Out Schemes | High | Recently enrolled providers (2023+) with >500% billing ramp-up within 6 months |
+| 4 | Impossible Service Volume | High | Providers with >500 claims per beneficiary per month — physically impossible |
+| 5 | Home Health Billing Abuse | High | Home health providers with claims:beneficiary ratio >50:1 on HCPCS G0151-G0162, G0299-G0300, S9122-S9124, T1019-T1022 |
+| 6 | Shell Entity Networks | Medium/High | Authorized officials controlling 5+ NPIs with combined high billing — potential fraud distribution |
+| 7 | Geographic Anomalies | Medium/High | Providers billing >4 standard deviations above their state's mean |
+| 8 | **Temporal Billing Anomalies** (Novel) | High | Month-over-month billing spikes >5x the 3-month moving average |
+| 9 | **Procedure Code Concentration** (Novel) | Medium | Providers billing >90% of revenue through 1-3 HCPCS codes — atypical for any specialty |
 
 ## Data Sources
 
-1. **Medicaid Provider Spending** (2.9GB Parquet, 227M rows) — queried remotely via DuckDB httpfs
-2. **OIG LEIE Exclusion List** (CSV) — downloaded locally
-3. **NPPES NPI Registry** (1GB zip) — downloaded and converted to slim Parquet, or queried via API
+1. **HHS Medicaid Provider Spending** (2.9GB Parquet, 227M rows, Jan 2018–Dec 2024)
+   - Queried via DuckDB httpfs (remote) or local download
+   - URL: `https://stopendataprod.blob.core.windows.net/datasets/medicaid-provider-spending/2026-02-09/medicaid-provider-spending.parquet`
+2. **OIG LEIE Exclusion List** (CSV, ~15MB) — downloaded locally
+   - URL: `https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv`
+3. **NPPES NPI Registry** (~1GB zip → 170MB slim Parquet)
+   - URL: `https://download.cms.gov/nppes/NPPES_Data_Dissemination_February_2026_V2.zip`
+   - Only 11 columns extracted for efficiency
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - DuckDB >= 1.4.0
-- pandas >= 2.0.0
 - requests >= 2.28.0
-- 3.7GB+ RAM (uses DuckDB with 2GB memory limit)
-- 2GB+ free disk space (for OIG CSV and NPPES slim parquet)
-- Internet connection (queries remote parquet file)
+- Internet connection (for remote parquet queries and OIG/NPPES downloads)
+- **Minimum 3.7GB RAM** (uses DuckDB out-of-core processing with configurable memory limit)
+- Works on both **Ubuntu 22.04+** and **macOS 14+ (Apple Silicon)**
 
-## Setup
+## Quick Start
 
 ```bash
-# Install dependencies (if not in venv)
+# Install dependencies and download data
+bash setup.sh
+
+# Run fraud detection (auto-detects system RAM)
+bash run.sh
+```
+
+## Manual Usage
+
+```bash
+# Install deps
 pip install -r requirements.txt
 
-# Download OIG exclusion list and NPPES data
+# Download OIG + NPPES data (parquet queried remotely)
 bash setup.sh
+
+# Run with custom options
+python3 detect_fraud.py --memory-limit 4GB
+python3 detect_fraud.py --no-gpu --signals 1,2,3
+python3 detect_fraud.py --output custom_output.json
 ```
 
-## Usage
+### Command-Line Options
 
-```bash
-# Full run (downloads data if needed, runs all signals)
-bash run.sh
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--no-gpu` | (no GPU used) | Explicit flag for GPU-free operation |
+| `--memory-limit` | `2GB` | DuckDB memory limit (auto-set by run.sh based on system RAM) |
+| `--output` | `fraud_signals.json` | Output file path |
+| `--signals` | `all` | Comma-separated signal numbers to run (e.g., `1,2,5`) |
 
-# Or run directly
-python3 detect_fraud.py
+## Output Format
+
+Produces `fraud_signals.json` matching the competition schema exactly:
+
+```json
+{
+  "generated_at": "ISO-8601 timestamp",
+  "tool_version": "2.0.0",
+  "data_sources_used": ["list of URLs"],
+  "methodology_summary": "...",
+  "total_providers_scanned": 0,
+  "total_providers_flagged": 0,
+  "total_estimated_overpayment_usd": 0.00,
+  "flagged_providers": [
+    {
+      "npi": "1234567890",
+      "provider_name": "...",
+      "entity_type": "individual|organization",
+      "taxonomy_code": "...",
+      "state": "XX",
+      "enumeration_date": "YYYY-MM-DD",
+      "total_paid_all_time": 0.00,
+      "total_claims_all_time": 0,
+      "total_unique_beneficiaries_all_time": 0,
+      "signals": [...],
+      "combined_estimated_overpayment_usd": 0.00,
+      "fca_relevance": {
+        "violation_description": "Provider-specific description",
+        "statute_reference": "31 U.S.C. section 3729(a)(1)(A)",
+        "estimated_government_loss": 0.00,
+        "suggested_investigation_steps": [
+          "NPI-specific, actionable steps"
+        ]
+      }
+    }
+  ]
+}
 ```
-
-## Output
-
-Produces `fraud_signals.json` with:
-- Summary statistics (providers scanned, flagged, estimated overpayment)
-- Per-provider details including NPI, name, entity type, taxonomy, state
-- Individual fraud signals with evidence, severity, and overpayment estimates
-- False Claims Act relevance with statute references and investigation steps
 
 ## Architecture
 
-The tool downloads the 2.9GB Medicaid spending Parquet file locally, then runs all 6 fraud signal queries against the local copy for fast, reliable analysis. DuckDB's httpfs extension is used for the initial download. Each fraud signal runs as an independent SQL query, and results are merged and enriched with NPPES provider details (via API fallback when local data unavailable).
+```
+detect_fraud.py          # Main engine — 9 signal detectors + merge + enrich
+setup.sh                 # Data download (OIG CSV, NPPES parquet, optionally Medicaid parquet)
+run.sh                   # Runner with auto memory detection
+requirements.txt         # Python dependencies
+fraud_signals.json       # Output (generated by run.sh)
+data/
+├── UPDATED.csv          # OIG LEIE exclusion list
+├── medicaid-*.parquet   # Local Medicaid data (optional — httpfs used if absent)
+└── nppes/
+    ├── nppes_slim.parquet  # NPPES NPI registry (11 columns, ~170MB)
+    └── mode.txt            # "parquet" or "api_fallback"
+```
 
-## Memory Management
+### Memory Management
 
-- DuckDB memory limit: 2GB
-- DuckDB threads: 2
-- Local parquet cached after first download (~2.9GB)
-- NPPES lookups via API with in-memory caching
-- Results capped at 150-200 providers per signal to control memory
+- DuckDB memory limit auto-configured by `run.sh` based on available RAM
+- Out-of-core processing: DuckDB spills to disk when memory is exceeded
+- Remote parquet via httpfs: no need to download 2.9GB file locally
+- NPPES slim parquet: 329 columns → 11 columns (8GB → 170MB)
+- Each signal runs as an independent SQL query to minimize peak memory
+- Results capped at 150-300 providers per signal to control output size
+
+### Signal Merging
+
+When a provider is flagged by multiple signals, they're merged into a single entry with all signals listed. Providers with multiple signals have their severity upgraded (medium → high). Combined overpayment is summed across all signals.
+
+## Overpayment Estimation Methodology
+
+Each signal uses a distinct, conservative methodology:
+
+| Signal | Method | Assumption |
+|--------|--------|------------|
+| Excluded providers | 100% of payments | All payments to excluded providers are improper per 42 CFR 1001.1901 |
+| Statistical outliers | Amount above 3-sigma | Only the statistically anomalous portion counts |
+| Bust-out schemes | 80% of peak billing | Most claims during ramp-up phase are fraudulent |
+| Impossible volume | 90% of flagged months | >500 claims/bene/month is phantom billing |
+| Home health abuse | Proportional excess | Claims above 10/beneficiary ratio applied to payments |
+| Shell entities | 30% of network billing | Conservative estimate for distributed fraud |
+| Geographic anomalies | Amount above 4-sigma | Only the extreme outlier portion |
+| Temporal anomalies | 70% of spike billing | Most billing during spikes is suspicious |
+| Procedure concentration | 40% of total billing | Single-code providers have atypical patterns |
 
 ## Legal Framework
 
-Fraud signals are mapped to the False Claims Act (31 U.S.C. 3729) with specific statute references:
-- **3729(a)(1)(A)**: Knowingly presenting false claims
-- **3729(a)(1)(B)**: Knowingly making false records/statements
-- **3729(a)(1)(C)**: Conspiracy to commit fraud
-- **3729(a)(1)(G)**: Knowingly concealing obligation to pay
+All flagged providers include False Claims Act relevance with:
+- **Violation descriptions** specific to each provider's NPI, name, state, and billing data
+- **Statute references**: 31 U.S.C. 3729(a)(1)(A/B/C/G)
+- **Investigation steps**: 5-6 actionable, provider-specific steps (not boilerplate)
+
+## Performance
+
+| Environment | Expected Time |
+|-------------|---------------|
+| Linux, 200GB RAM, GPU | < 15 minutes |
+| Linux, 64GB RAM, no GPU | < 30 minutes |
+| MacBook, 16GB RAM, Apple Silicon | < 2 hours |
+| Linux, 3.7GB RAM, no GPU (via httpfs) | ~ 30-60 minutes |
 
 ## License
 
