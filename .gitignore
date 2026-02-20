@@ -1,8 +1,8 @@
 data/
-*.pyc
+*.parquet
 __pycache__/
-.DS_Store
-*.log
+.pytest_cache/
+*.pyc
+fraud_signals.json
 venv/
 .env
-run.log

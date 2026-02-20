@@ -1,175 +1,83 @@
-# Medicaid Provider Fraud Signal Detection Engine
+# Medicaid Fraud Signal Detection Engine
 
-A Python tool that analyzes 227 million rows of CMS Medicaid provider spending data (Jan 2018 – Dec 2024) to detect fraud signals. Cross-references billing data with the OIG LEIE exclusion list and NPPES NPI registry to identify providers with suspicious billing patterns.
+Detects 6 types of fraud signals in Medicaid provider spending data by cross-referencing the HHS spending dataset (227M rows), OIG LEIE exclusion list, and CMS NPPES NPI registry.
 
-## Fraud Signals Detected (9 total)
-
-| # | Signal | Severity | Description |
-|---|--------|----------|-------------|
-| 1 | Excluded Provider Billing | Critical | Providers on the OIG exclusion list still receiving Medicaid payments after their exclusion date |
-| 2 | Statistical Billing Outliers | High | Providers billing >3 standard deviations above the mean with robust statistics (median/IQR) |
-| 3 | Bust-Out Schemes | High | Recently enrolled providers (2023+) with >500% billing ramp-up within 6 months |
-| 4 | Impossible Service Volume | High | Providers with >500 claims per beneficiary per month — physically impossible |
-| 5 | Home Health Billing Abuse | High | Home health providers with claims:beneficiary ratio >50:1 on HCPCS G0151-G0162, G0299-G0300, S9122-S9124, T1019-T1022 |
-| 6 | Shell Entity Networks | Medium/High | Authorized officials controlling 5+ NPIs with combined high billing — potential fraud distribution |
-| 7 | Geographic Anomalies | Medium/High | Providers billing >4 standard deviations above their state's mean |
-| 8 | **Temporal Billing Anomalies** (Novel) | High | Month-over-month billing spikes >5x the 3-month moving average |
-| 9 | **Procedure Code Concentration** (Novel) | Medium | Providers billing >90% of revenue through 1-3 HCPCS codes — atypical for any specialty |
-
-## Data Sources
-
-1. **HHS Medicaid Provider Spending** (2.9GB Parquet, 227M rows, Jan 2018–Dec 2024)
-   - Queried via DuckDB httpfs (remote) or local download
-   - URL: `https://stopendataprod.blob.core.windows.net/datasets/medicaid-provider-spending/2026-02-09/medicaid-provider-spending.parquet`
-2. **OIG LEIE Exclusion List** (CSV, ~15MB) — downloaded locally
-   - URL: `https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv`
-3. **NPPES NPI Registry** (~1GB zip → 170MB slim Parquet)
-   - URL: `https://download.cms.gov/nppes/NPPES_Data_Dissemination_February_2026_V2.zip`
-   - Only 11 columns extracted for efficiency
-
-## Requirements
-
-- Python 3.11+
-- DuckDB >= 1.4.0
-- requests >= 2.28.0
-- Internet connection (for remote parquet queries and OIG/NPPES downloads)
-- **Minimum 3.7GB RAM** (uses DuckDB out-of-core processing with configurable memory limit)
-- Works on both **Ubuntu 22.04+** and **macOS 14+ (Apple Silicon)**
+Built with DuckDB for memory-efficient out-of-core analytics — runs on machines with as little as 2GB available RAM.
 
 ## Quick Start
 
 ```bash
 # Install dependencies and download data
-bash setup.sh
+./setup.sh
 
-# Run fraud detection (auto-detects system RAM)
-bash run.sh
+# Run analysis
+./run.sh
+# Output: fraud_signals.json
 ```
 
-## Manual Usage
+## Fraud Signals Detected
 
-```bash
-# Install deps
-pip install -r requirements.txt
-
-# Download OIG + NPPES data (parquet queried remotely)
-bash setup.sh
-
-# Run with custom options
-python3 detect_fraud.py --memory-limit 4GB
-python3 detect_fraud.py --no-gpu --signals 1,2,3
-python3 detect_fraud.py --output custom_output.json
-```
-
-### Command-Line Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--no-gpu` | (no GPU used) | Explicit flag for GPU-free operation |
-| `--memory-limit` | `2GB` | DuckDB memory limit (auto-set by run.sh based on system RAM) |
-| `--output` | `fraud_signals.json` | Output file path |
-| `--signals` | `all` | Comma-separated signal numbers to run (e.g., `1,2,5`) |
-
-## Output Format
-
-Produces `fraud_signals.json` matching the competition schema exactly:
-
-```json
-{
-  "generated_at": "ISO-8601 timestamp",
-  "tool_version": "2.0.0",
-  "data_sources_used": ["list of URLs"],
-  "methodology_summary": "...",
-  "total_providers_scanned": 0,
-  "total_providers_flagged": 0,
-  "total_estimated_overpayment_usd": 0.00,
-  "flagged_providers": [
-    {
-      "npi": "1234567890",
-      "provider_name": "...",
-      "entity_type": "individual|organization",
-      "taxonomy_code": "...",
-      "state": "XX",
-      "enumeration_date": "YYYY-MM-DD",
-      "total_paid_all_time": 0.00,
-      "total_claims_all_time": 0,
-      "total_unique_beneficiaries_all_time": 0,
-      "signals": [...],
-      "combined_estimated_overpayment_usd": 0.00,
-      "fca_relevance": {
-        "violation_description": "Provider-specific description",
-        "statute_reference": "31 U.S.C. section 3729(a)(1)(A)",
-        "estimated_government_loss": 0.00,
-        "suggested_investigation_steps": [
-          "NPI-specific, actionable steps"
-        ]
-      }
-    }
-  ]
-}
-```
+| # | Signal | Severity | Description |
+|---|--------|----------|-------------|
+| 1 | Excluded Provider | Critical | Provider on OIG exclusion list still billing Medicaid |
+| 2 | Billing Outlier | High/Medium | Provider billing exceeds 99th percentile of taxonomy+state peer group |
+| 3 | Rapid Escalation | High/Medium | New entity with >200% rolling 3-month billing growth |
+| 4 | Workforce Impossibility | High | Organization billing >6 claims/hour (physically impossible volume) |
+| 5 | Shared Official | High/Medium | One person controls 5+ NPIs with >$1M combined billing |
+| 6 | Geographic Implausibility | Medium | Home health provider with <0.1 beneficiary/claims ratio |
 
 ## Architecture
 
 ```
-detect_fraud.py          # Main engine — 9 signal detectors + merge + enrich
-setup.sh                 # Data download (OIG CSV, NPPES parquet, optionally Medicaid parquet)
-run.sh                   # Runner with auto memory detection
-requirements.txt         # Python dependencies
-fraud_signals.json       # Output (generated by run.sh)
-data/
-├── UPDATED.csv          # OIG LEIE exclusion list
-├── medicaid-*.parquet   # Local Medicaid data (optional — httpfs used if absent)
-└── nppes/
-    ├── nppes_slim.parquet  # NPPES NPI registry (11 columns, ~170MB)
-    └── mode.txt            # "parquet" or "api_fallback"
+src/
+  ingest.py    — DuckDB data loading (parquet, CSV, zip streaming)
+  signals.py   — All 6 signal implementations as SQL queries
+  output.py    — JSON report generation with FCA statute mapping
+  main.py      — CLI entry point
+tests/
+  conftest.py      — Synthetic data fixtures (triggers all 6 signals)
+  test_signals.py  — 26 unit tests (4+ per signal)
 ```
 
-### Memory Management
+## Data Sources
 
-- DuckDB memory limit auto-configured by `run.sh` based on available RAM
-- Out-of-core processing: DuckDB spills to disk when memory is exceeded
-- Remote parquet via httpfs: no need to download 2.9GB file locally
-- NPPES slim parquet: 329 columns → 11 columns (8GB → 170MB)
-- Each signal runs as an independent SQL query to minimize peak memory
-- Results capped at 150-300 providers per signal to control output size
+| Dataset | Size | Format | Source |
+|---------|------|--------|--------|
+| Medicaid Spending | 2.9 GB | Parquet | HHS STOP |
+| OIG LEIE | 15 MB | CSV | oig.hhs.gov |
+| NPPES NPI Registry | 1 GB (zip) | CSV → Parquet | CMS |
 
-### Signal Merging
+The tool automatically builds a slim NPPES parquet (~177 MB) from the full 11 GB CSV, extracting only the 11 columns needed.
 
-When a provider is flagged by multiple signals, they're merged into a single entry with all signals listed. Providers with multiple signals have their severity upgraded (medium → high). Combined overpayment is summed across all signals.
+## Memory Management
 
-## Overpayment Estimation Methodology
+DuckDB processes the 2.9 GB parquet file out-of-core without loading it into RAM. Default memory limit is 2 GB.
 
-Each signal uses a distinct, conservative methodology:
+```bash
+# Adjust for your hardware
+./run.sh --memory-limit 8GB    # More RAM = faster
+./run.sh --memory-limit 1GB    # Constrained environments
+./run.sh --no-gpu              # CPU-only (default, GPU not used)
+```
 
-| Signal | Method | Assumption |
-|--------|--------|------------|
-| Excluded providers | 100% of payments | All payments to excluded providers are improper per 42 CFR 1001.1901 |
-| Statistical outliers | Amount above 3-sigma | Only the statistically anomalous portion counts |
-| Bust-out schemes | 80% of peak billing | Most claims during ramp-up phase are fraudulent |
-| Impossible volume | 90% of flagged months | >500 claims/bene/month is phantom billing |
-| Home health abuse | Proportional excess | Claims above 10/beneficiary ratio applied to payments |
-| Shell entities | 30% of network billing | Conservative estimate for distributed fraud |
-| Geographic anomalies | Amount above 4-sigma | Only the extreme outlier portion |
-| Temporal anomalies | 70% of spike billing | Most billing during spikes is suspicious |
-| Procedure concentration | 40% of total billing | Single-code providers have atypical patterns |
+## Testing
 
-## Legal Framework
+```bash
+pytest tests/ -v
+```
 
-All flagged providers include False Claims Act relevance with:
-- **Violation descriptions** specific to each provider's NPI, name, state, and billing data
-- **Statute references**: 31 U.S.C. 3729(a)(1)(A/B/C/G)
-- **Investigation steps**: 5-6 actionable, provider-specific steps (not boilerplate)
+All 26 tests use synthetic data fixtures that trigger each signal, verifying detection logic, severity classification, overpayment calculations, and output format compliance.
 
-## Performance
+## Output Schema
 
-| Environment | Expected Time |
-|-------------|---------------|
-| Linux, 200GB RAM, GPU | < 15 minutes |
-| Linux, 64GB RAM, no GPU | < 30 minutes |
-| MacBook, 16GB RAM, Apple Silicon | < 2 hours |
-| Linux, 3.7GB RAM, no GPU (via httpfs) | ~ 30-60 minutes |
+See `fraud_signals.json` for the complete output. Each flagged provider includes:
+- All signal evidence with severity classification
+- Estimated overpayment in USD (per-signal formulas from spec)
+- FCA statute references (31 U.S.C. § 3729)
+- Actionable next steps for qui tam / FCA lawyers
 
-## License
+## Requirements
 
-MIT
+- Python 3.11+
+- DuckDB, Polars, PyArrow (pip-installable)
+- Works on Ubuntu 22.04+ and macOS 14+ (Apple Silicon)
