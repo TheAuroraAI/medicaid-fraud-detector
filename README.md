@@ -37,6 +37,7 @@ src/
 tests/
   conftest.py      — Synthetic data fixtures (triggers all 6 signals)
   test_signals.py  — 26 unit tests (4+ per signal)
+  fixtures/        — CSV fixture files for each dataset
 ```
 
 ## Data Sources
