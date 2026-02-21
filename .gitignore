@@ -3,6 +3,6 @@ data/
 __pycache__/
 .pytest_cache/
 *.pyc
-fraud_signals.json
+# fraud_signals.json intentionally included in repo
 venv/
 .env
