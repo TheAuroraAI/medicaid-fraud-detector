@@ -15,6 +15,16 @@ from src.signals import (
     signal_address_clustering,
     signal_upcoding,
     signal_concurrent_billing,
+    signal_burst_enrollment_network,
+    signal_coordinated_billing_ramp,
+    signal_phantom_servicing_hub,
+    signal_network_beneficiary_dilution,
+    signal_caregiver_density_anomaly,
+    signal_repetitive_service_abuse,
+    signal_billing_monoculture,
+    signal_billing_bust_out,
+    signal_reimbursement_rate_anomaly,
+    signal_phantom_servicing_spread,
     run_all_signals,
 )
 from src.output import (
@@ -23,12 +33,14 @@ from src.output import (
     compute_risk_score,
     generate_case_narrative,
     generate_executive_summary,
+    is_known_legitimate_entity,
+    is_high_threshold_entity,
     STATUTE_MAP,
     NEXT_STEPS_MAP,
     CLAIM_TYPE_MAP,
     METHODOLOGY,
 )
-from src.signals import compute_cross_signal_correlations
+from src.signals import compute_cross_signal_correlations, _is_covid_era, COVID_HCPCS
 
 
 class TestSignalExcludedProvider:
@@ -126,8 +138,8 @@ class TestSignalWorkforceImpossibility:
         wf = [r for r in results if r["npi"] == "5555555555"]
         assert len(wf) == 1
         ev = wf[0]["evidence"]
-        assert "implied_claims_per_hour" in ev
-        assert ev["implied_claims_per_hour"] > 6.0
+        assert "implied_claims_per_worker_hour" in ev
+        assert ev["implied_claims_per_worker_hour"] > 6.0
         assert "peak_month" in ev
         assert "peak_claims_count" in ev
 
@@ -168,24 +180,27 @@ class TestSignalSharedOfficial:
 
 
 class TestSignalGeographicImplausibility:
-    """Signal 6: Geographic Implausibility."""
+    """Signal 6: Geographic Implausibility (multi-state billing mismatch)."""
 
     def test_detects_geographic_implausibility(self, con):
         results = signal_geographic_implausibility(con)
         assert len(results) >= 1
         npis = [r["npi"] for r in results]
-        assert "7777777777" in npis
+        assert "7777777778" in npis
 
-    def test_geo_has_ratio(self, con):
+    def test_geo_has_evidence_fields(self, con):
         results = signal_geographic_implausibility(con)
-        geo = [r for r in results if r["npi"] == "7777777777"]
+        geo = [r for r in results if r["npi"] == "7777777778"]
         assert len(geo) == 1
         ev = geo[0]["evidence"]
-        assert "beneficiary_claims_ratio" in ev
-        assert ev["beneficiary_claims_ratio"] < 0.1
-        assert "flagged_hcpcs_codes" in ev
+        assert "registered_state" in ev
+        assert ev["registered_state"] == "WA"
+        assert "home_state_pct" in ev
+        assert ev["home_state_pct"] < 10.0
+        assert "foreign_states_count" in ev
+        assert ev["foreign_states_count"] >= 2
 
-    def test_does_not_flag_normal_home_health(self, con):
+    def test_does_not_flag_normal_provider(self, con):
         results = signal_geographic_implausibility(con)
         npis = [r["npi"] for r in results]
         assert "1111111111" not in npis
@@ -295,6 +310,347 @@ class TestSignalConcurrentBilling:
         assert "5555555555" not in npis
 
 
+class TestSignalBurstEnrollmentNetwork:
+    """Signal 10: Burst Enrollment Network."""
+
+    def test_detects_burst_enrollment(self, con):
+        results = signal_burst_enrollment_network(con)
+        assert len(results) >= 1
+        # Should find the OH / 261QR0400X / Q1 2023 cluster
+        found = False
+        for r in results:
+            ev = r["evidence"]
+            if ev["state"] == "OH" and ev["taxonomy_code"] == "261QR0400X":
+                found = True
+                assert ev["npi_count"] >= 4
+                assert ev["combined_total_paid"] > 500000
+        assert found
+
+    def test_burst_has_required_evidence(self, con):
+        results = signal_burst_enrollment_network(con)
+        for r in results:
+            assert r["signal_type"] == "burst_enrollment_network"
+            ev = r["evidence"]
+            assert "taxonomy_code" in ev
+            assert "state" in ev
+            assert "npi_count" in ev
+            assert "enrolled_npis" in ev
+            assert "combined_total_paid" in ev
+            assert "earliest_enumeration" in ev
+            assert "latest_enumeration" in ev
+
+    def test_burst_severity(self, con):
+        results = signal_burst_enrollment_network(con)
+        for r in results:
+            assert r["severity"] in ("medium", "high")
+
+    def test_burst_overpayment(self, con):
+        results = signal_burst_enrollment_network(con)
+        for r in results:
+            assert r["estimated_overpayment_usd"] > 0
+            # Should be 25% of combined paid
+            expected = r["evidence"]["combined_total_paid"] * 0.25
+            assert abs(r["estimated_overpayment_usd"] - expected) < 1.0
+
+    def test_does_not_flag_single_org(self, con):
+        results = signal_burst_enrollment_network(con)
+        # No cluster should have fewer than 4 NPIs
+        for r in results:
+            assert r["evidence"]["npi_count"] >= 4
+
+
+class TestSignalCoordinatedBillingRamp:
+    """Signal 11: Coordinated Billing Ramp."""
+
+    def test_detects_coordinated_ramp(self, con):
+        results = signal_coordinated_billing_ramp(con)
+        assert len(results) >= 1
+        # Should find the ROBERT SMITH network (5 NPIs, all peaking in similar months)
+        found = False
+        for r in results:
+            ev = r["evidence"]
+            if "ROBERT" in ev["authorized_official_name"] and "SMITH" in ev["authorized_official_name"]:
+                found = True
+                assert ev["npis_in_network"] >= 3
+                assert ev["peak_spread_months"] <= 3
+        assert found
+
+    def test_coordinated_has_required_evidence(self, con):
+        results = signal_coordinated_billing_ramp(con)
+        for r in results:
+            assert r["signal_type"] == "coordinated_billing_ramp"
+            ev = r["evidence"]
+            assert "authorized_official_name" in ev
+            assert "npis_in_network" in ev
+            assert "network_npis" in ev
+            assert "peak_spread_months" in ev
+            assert "network_total_paid" in ev
+
+    def test_coordinated_overpayment(self, con):
+        results = signal_coordinated_billing_ramp(con)
+        for r in results:
+            assert r["estimated_overpayment_usd"] > 0
+
+
+class TestSignalPhantomServicingHub:
+    """Signal 12: Phantom Servicing Hub."""
+
+    def test_detects_phantom_hub(self, con):
+        results = signal_phantom_servicing_hub(con)
+        assert len(results) >= 1
+        npis = [r["npi"] for r in results]
+        assert "1290000000" in npis
+
+    def test_hub_has_required_evidence(self, con):
+        results = signal_phantom_servicing_hub(con)
+        hub = [r for r in results if r["npi"] == "1290000000"]
+        assert len(hub) == 1
+        ev = hub[0]["evidence"]
+        assert ev["distinct_billing_npis"] >= 5
+        assert ev["total_paid_through_hub"] > 0
+        assert "billing_npi_list" in ev
+        assert "beneficiary_claim_ratio" in ev
+
+    def test_hub_overpayment(self, con):
+        results = signal_phantom_servicing_hub(con)
+        hub = [r for r in results if r["npi"] == "1290000000"]
+        assert len(hub) == 1
+        assert hub[0]["estimated_overpayment_usd"] > 0
+        # Should be 35% of total paid
+        expected = hub[0]["evidence"]["total_paid_through_hub"] * 0.35
+        assert abs(hub[0]["estimated_overpayment_usd"] - expected) < 1.0
+
+    def test_does_not_flag_self_servicing(self, con):
+        results = signal_phantom_servicing_hub(con)
+        # Self-servicing providers should not appear as hubs
+        for r in results:
+            ev = r["evidence"]
+            if "billing_npi_list" in ev:
+                assert r["npi"] not in ev["billing_npi_list"] or ev["distinct_billing_npis"] >= 5
+
+
+class TestSignalNetworkBeneficiaryDilution:
+    """Signal 13: Network Beneficiary Dilution."""
+
+    def test_detects_beneficiary_dilution(self, con):
+        results = signal_network_beneficiary_dilution(con)
+        assert len(results) >= 1
+        # Should find the MARY JONES network with extremely high claims/bene
+        found = False
+        for r in results:
+            ev = r["evidence"]
+            if "MARY" in ev["authorized_official_name"] and "JONES" in ev["authorized_official_name"]:
+                found = True
+                assert ev["claims_per_beneficiary"] > 50
+        assert found
+
+    def test_dilution_has_required_evidence(self, con):
+        results = signal_network_beneficiary_dilution(con)
+        for r in results:
+            assert r["signal_type"] == "network_beneficiary_dilution"
+            ev = r["evidence"]
+            assert "authorized_official_name" in ev
+            assert "npi_count" in ev
+            assert "claims_per_beneficiary" in ev
+            assert "network_beneficiary_ratio" in ev
+            assert "combined_total_paid" in ev
+
+    def test_dilution_overpayment(self, con):
+        results = signal_network_beneficiary_dilution(con)
+        for r in results:
+            assert r["estimated_overpayment_usd"] > 0
+
+    def test_dilution_severity(self, con):
+        results = signal_network_beneficiary_dilution(con)
+        for r in results:
+            assert r["severity"] in ("medium", "high", "critical")
+
+
+class TestSignalCaregiverDensityAnomaly:
+    """Signal 14: Family Caregiver Density Anomaly."""
+
+    def test_detects_anomalous_zip(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        assert len(results) >= 1
+        # Should flag providers in zip 55501
+        zips = [r["evidence"]["zip_code"] for r in results]
+        assert "55501" in zips
+
+    def test_has_required_evidence(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        for r in results:
+            assert r["signal_type"] == "caregiver_density_anomaly"
+            ev = r["evidence"]
+            assert "zip_code" in ev
+            assert "state" in ev
+            assert "provider_count" in ev
+            assert "individual_provider_count" in ev
+            assert "individual_provider_ratio" in ev
+            assert "total_hh_paid" in ev
+            assert "beneficiaries_per_individual_provider" in ev
+            assert "ratio_to_state_median" in ev
+            assert ev["ratio_to_state_median"] > 3.0
+
+    def test_low_beneficiaries_per_provider(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        flagged_55501 = [r for r in results if r["evidence"]["zip_code"] == "55501"]
+        assert len(flagged_55501) >= 1
+        ev = flagged_55501[0]["evidence"]
+        assert ev["beneficiaries_per_individual_provider"] < 5.0
+
+    def test_does_not_flag_normal_zip(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        zips = [r["evidence"]["zip_code"] for r in results]
+        assert "55502" not in zips
+        assert "55503" not in zips
+
+    def test_overpayment_positive(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        for r in results:
+            assert r["estimated_overpayment_usd"] >= 0
+
+    def test_severity_levels(self, con):
+        results = signal_caregiver_density_anomaly(con)
+        for r in results:
+            assert r["severity"] in ("medium", "high")
+
+    def test_census_enrichment_present(self, con):
+        """Census data is loaded in test fixture, so enrichment fields should appear."""
+        results = signal_caregiver_density_anomaly(con)
+        flagged_55501 = [r for r in results if r["evidence"]["zip_code"] == "55501"]
+        if flagged_55501:
+            ev = flagged_55501[0]["evidence"]
+            assert "census_vulnerable_population" in ev
+            assert "census_ratio_to_state_median" in ev
+
+
+class TestSignalRepetitiveServiceAbuse:
+    """Signal 15: Repetitive Service Abuse."""
+
+    def test_detects_repetitive_abuse(self, con):
+        results = signal_repetitive_service_abuse(con)
+        npis = [r["npi"] for r in results]
+        assert "1500000001" in npis
+
+    def test_has_required_evidence(self, con):
+        results = signal_repetitive_service_abuse(con)
+        flagged = [r for r in results if r["npi"] == "1500000001"]
+        assert len(flagged) >= 1
+        ev = flagged[0]["evidence"]
+        assert "hcpcs_code" in ev
+        assert "claims_per_beneficiary" in ev
+        assert "peer_99th_percentile_claims_per_bene" in ev
+        assert ev["claims_per_beneficiary"] > ev["peer_99th_percentile_claims_per_bene"]
+
+    def test_overpayment_positive(self, con):
+        results = signal_repetitive_service_abuse(con)
+        flagged = [r for r in results if r["npi"] == "1500000001"]
+        assert flagged[0]["estimated_overpayment_usd"] > 0
+
+    def test_normal_peers_not_flagged(self, con):
+        results = signal_repetitive_service_abuse(con)
+        npis = [r["npi"] for r in results]
+        for peer in ["1500000002", "1500000003", "1500000011"]:
+            assert peer not in npis
+
+
+class TestSignalBillingMonoculture:
+    """Signal 16: Billing Monoculture."""
+
+    def test_detects_monoculture(self, con):
+        results = signal_billing_monoculture(con)
+        npis = [r["npi"] for r in results]
+        assert "1600000001" in npis
+
+    def test_has_required_evidence(self, con):
+        results = signal_billing_monoculture(con)
+        flagged = [r for r in results if r["npi"] == "1600000001"]
+        assert len(flagged) >= 1
+        ev = flagged[0]["evidence"]
+        assert "dominant_hcpcs_code" in ev
+        assert "dominant_code_share_pct" in ev
+        assert ev["dominant_code_share_pct"] > 85.0
+
+    def test_overpayment_positive(self, con):
+        results = signal_billing_monoculture(con)
+        flagged = [r for r in results if r["npi"] == "1600000001"]
+        assert flagged[0]["estimated_overpayment_usd"] > 0
+
+
+class TestSignalBillingBustOut:
+    """Signal 17: Billing Bust-Out Pattern."""
+
+    def test_detects_bust_out(self, con):
+        results = signal_billing_bust_out(con)
+        npis = [r["npi"] for r in results]
+        assert "1700000001" in npis
+
+    def test_has_required_evidence(self, con):
+        results = signal_billing_bust_out(con)
+        flagged = [r for r in results if r["npi"] == "1700000001"]
+        assert len(flagged) >= 1
+        ev = flagged[0]["evidence"]
+        assert "peak_month" in ev
+        assert "peak_paid" in ev
+        assert "post_peak_pct_of_peak" in ev
+        assert ev["post_peak_pct_of_peak"] < 10.0
+
+    def test_overpayment_positive(self, con):
+        results = signal_billing_bust_out(con)
+        flagged = [r for r in results if r["npi"] == "1700000001"]
+        assert flagged[0]["estimated_overpayment_usd"] > 0
+
+
+class TestSignalReimbursementRateAnomaly:
+    """Signal 18: Reimbursement Rate Anomaly."""
+
+    def test_detects_rate_anomaly(self, con):
+        results = signal_reimbursement_rate_anomaly(con)
+        npis = [r["npi"] for r in results]
+        assert "1800000001" in npis
+
+    def test_has_required_evidence(self, con):
+        results = signal_reimbursement_rate_anomaly(con)
+        flagged = [r for r in results if r["npi"] == "1800000001"]
+        assert len(flagged) >= 1
+        ev = flagged[0]["evidence"]
+        assert "hcpcs_code" in ev
+        assert ev["hcpcs_code"] == "99214"
+        assert "avg_rate_per_claim" in ev
+        assert "national_median_rate" in ev
+        assert "rate_ratio_to_median" in ev
+        assert ev["rate_ratio_to_median"] > 3.0
+
+    def test_overpayment_positive(self, con):
+        results = signal_reimbursement_rate_anomaly(con)
+        flagged = [r for r in results if r["npi"] == "1800000001"]
+        assert flagged[0]["estimated_overpayment_usd"] > 0
+
+
+class TestSignalPhantomServicingSpread:
+    """Signal 19: Phantom Servicing Spread."""
+
+    def test_detects_phantom_spread(self, con):
+        results = signal_phantom_servicing_spread(con)
+        npis = [r["npi"] for r in results]
+        assert "1900000000" in npis
+
+    def test_has_required_evidence(self, con):
+        results = signal_phantom_servicing_spread(con)
+        flagged = [r for r in results if r["npi"] == "1900000000"]
+        assert len(flagged) >= 1
+        ev = flagged[0]["evidence"]
+        assert "distinct_billing_npis" in ev
+        assert "claims_per_beneficiary" in ev
+        assert ev["distinct_billing_npis"] >= 5
+        assert ev["claims_per_beneficiary"] > 100
+
+    def test_overpayment_positive(self, con):
+        results = signal_phantom_servicing_spread(con)
+        flagged = [r for r in results if r["npi"] == "1900000000"]
+        assert flagged[0]["estimated_overpayment_usd"] > 0
+
+
 class TestRunAllSignals:
     """Test the run_all_signals orchestrator."""
 
@@ -304,6 +660,12 @@ class TestRunAllSignals:
             "excluded_provider", "billing_outlier", "rapid_escalation",
             "workforce_impossibility", "shared_official", "geographic_implausibility",
             "address_clustering", "upcoding", "concurrent_billing",
+            "burst_enrollment_network", "coordinated_billing_ramp",
+            "phantom_servicing_hub", "network_beneficiary_dilution",
+            "caregiver_density_anomaly",
+            "repetitive_service_abuse", "billing_monoculture",
+            "billing_bust_out", "reimbursement_rate_anomaly",
+            "phantom_servicing_spread",
         ]
         for t in expected_types:
             assert t in results
@@ -545,6 +907,10 @@ class TestOutputGeneration:
         assert STATUTE_MAP["address_clustering"] == "31 U.S.C. section 3729(a)(1)(C)"
         assert STATUTE_MAP["upcoding"] == "31 U.S.C. section 3729(a)(1)(A)"
         assert STATUTE_MAP["concurrent_billing"] == "31 U.S.C. section 3729(a)(1)(B)"
+        assert STATUTE_MAP["burst_enrollment_network"] == "31 U.S.C. section 3729(a)(1)(C)"
+        assert STATUTE_MAP["coordinated_billing_ramp"] == "31 U.S.C. section 3729(a)(1)(C)"
+        assert STATUTE_MAP["phantom_servicing_hub"] == "31 U.S.C. section 3729(a)(1)(A)"
+        assert STATUTE_MAP["network_beneficiary_dilution"] == "31 U.S.C. section 3729(a)(1)(A)"
 
     def test_next_steps_have_two_per_signal(self):
         for signal_type, steps in NEXT_STEPS_MAP.items():
@@ -609,6 +975,12 @@ class TestMethodology:
             "excluded_provider", "billing_outlier", "rapid_escalation",
             "workforce_impossibility", "shared_official", "geographic_implausibility",
             "address_clustering", "upcoding", "concurrent_billing",
+            "burst_enrollment_network", "coordinated_billing_ramp",
+            "phantom_servicing_hub", "network_beneficiary_dilution",
+            "caregiver_density_anomaly",
+            "repetitive_service_abuse", "billing_monoculture",
+            "billing_bust_out", "reimbursement_rate_anomaly",
+            "phantom_servicing_spread",
         ]
         for sig_type in signal_types:
             assert sig_type in METHODOLOGY["signals"], f"Missing methodology for {sig_type}"
@@ -633,6 +1005,12 @@ class TestClaimTypeMap:
             "excluded_provider", "billing_outlier", "rapid_escalation",
             "workforce_impossibility", "shared_official", "geographic_implausibility",
             "address_clustering", "upcoding", "concurrent_billing",
+            "burst_enrollment_network", "coordinated_billing_ramp",
+            "phantom_servicing_hub", "network_beneficiary_dilution",
+            "caregiver_density_anomaly",
+            "repetitive_service_abuse", "billing_monoculture",
+            "billing_bust_out", "reimbursement_rate_anomaly",
+            "phantom_servicing_spread",
         ]
         for sig_type in signal_types:
             assert sig_type in CLAIM_TYPE_MAP, f"Missing claim type for {sig_type}"
@@ -643,6 +1021,12 @@ class TestClaimTypeMap:
             "excluded_provider", "billing_outlier", "rapid_escalation",
             "workforce_impossibility", "shared_official", "geographic_implausibility",
             "address_clustering", "upcoding", "concurrent_billing",
+            "burst_enrollment_network", "coordinated_billing_ramp",
+            "phantom_servicing_hub", "network_beneficiary_dilution",
+            "caregiver_density_anomaly",
+            "repetitive_service_abuse", "billing_monoculture",
+            "billing_bust_out", "reimbursement_rate_anomaly",
+            "phantom_servicing_spread",
         ]
         for sig_type in signal_types:
             assert sig_type in STATUTE_MAP
@@ -663,6 +1047,16 @@ class TestEdgeCases:
             "address_clustering": [],
             "upcoding": [],
             "concurrent_billing": [],
+            "burst_enrollment_network": [],
+            "coordinated_billing_ramp": [],
+            "phantom_servicing_hub": [],
+            "network_beneficiary_dilution": [],
+            "caregiver_density_anomaly": [],
+            "repetitive_service_abuse": [],
+            "billing_monoculture": [],
+            "billing_bust_out": [],
+            "reimbursement_rate_anomaly": [],
+            "phantom_servicing_spread": [],
         }
         report = generate_report(empty_results, con, 0)
         assert report["total_providers_flagged"] == 0
@@ -706,6 +1100,12 @@ class TestEdgeCases:
             "excluded_provider", "billing_outlier", "rapid_escalation",
             "workforce_impossibility", "shared_official", "geographic_implausibility",
             "address_clustering", "upcoding", "concurrent_billing",
+            "burst_enrollment_network", "coordinated_billing_ramp",
+            "phantom_servicing_hub", "network_beneficiary_dilution",
+            "caregiver_density_anomaly",
+            "repetitive_service_abuse", "billing_monoculture",
+            "billing_bust_out", "reimbursement_rate_anomaly",
+            "phantom_servicing_spread",
         ]
         for sig_type in signal_types:
             assert sig_type in SIGNAL_RISK_WEIGHTS, f"Missing risk weight for {sig_type}"
@@ -796,3 +1196,141 @@ class TestHtmlReportDetails:
             assert "score-fill" in content
         finally:
             os.unlink(tmp_path)
+
+
+class TestKnownLegitimateEntityFilter:
+    """Test the known legitimate entity filter to prevent false positives."""
+
+    def test_filters_school_districts(self):
+        assert is_known_legitimate_entity("ANTIOCH UNIFIED SCHOOL DISTRICT")
+        assert is_known_legitimate_entity("FAIRFIELD PUBLIC SCHOOLS")
+        assert is_known_legitimate_entity("THE SCHOOL BOARD OF BROWARD COUNTY FLORIDA")
+        assert is_known_legitimate_entity("MCKINNEY INDEPENDENT SCHOOL DISTRICT")
+        assert is_known_legitimate_entity("HUNTERDON COUNTY EDUCATIONAL SERVICES COMMISSION")
+
+    def test_filters_national_labs(self):
+        assert is_known_legitimate_entity("QUEST DIAGNOSTICS CLINICAL LABORATORIES INC")
+        assert is_known_legitimate_entity("LABCORP INDIANA INC")
+
+    def test_filters_major_health_systems(self):
+        assert is_known_legitimate_entity("KAISER FOUNDATION HOSPITALS")
+        assert is_known_legitimate_entity("THE JOHNS HOPKINS HOSPITAL")
+        assert is_known_legitimate_entity("MAYO CLINIC HEALTH SYSTEM")
+        assert is_known_legitimate_entity("CLEVELAND CLINIC HOME CARE SERVICES")
+        assert is_known_legitimate_entity("FRESENIUS MEDICAL CARE")
+        assert is_known_legitimate_entity("STANFORD HEALTH CARE")
+        assert is_known_legitimate_entity("MOUNT SINAI HOSPITAL")
+
+    def test_filters_universities(self):
+        assert is_known_legitimate_entity("REGENTS OF THE UNIVERSITY OF MICHIGAN")
+        assert is_known_legitimate_entity("UNIVERSITY OF COLORADO")
+
+    def test_filters_nonprofits(self):
+        assert is_known_legitimate_entity("VISITING NURSE SERVICE OF NEW YORK HOME CARE II")
+        assert is_known_legitimate_entity("THE SALVATION ARMY")
+        assert is_known_legitimate_entity("PLANNED PARENTHOOD LOS ANGELES")
+
+    def test_does_not_filter_suspicious_names(self):
+        assert not is_known_legitimate_entity("ACME MEDICAL SERVICES LLC")
+        assert not is_known_legitimate_entity("SUNSHINE HOME HEALTH CARE")
+        assert not is_known_legitimate_entity("DR JOHN SMITH")
+        assert not is_known_legitimate_entity("RAPID CARE SOLUTIONS INC")
+
+    def test_empty_and_none(self):
+        assert not is_known_legitimate_entity("")
+        assert not is_known_legitimate_entity(None)
+
+
+class TestHighThresholdEntities:
+    """Tribal health and government entities require exceptional evidence."""
+
+    def test_detects_government_entities(self):
+        assert is_high_threshold_entity("COUNTY OF LOS ANGELES")
+        assert is_high_threshold_entity("STATE OF TENNESSEE")
+        assert is_high_threshold_entity("CITY OF HOUSTON")
+        assert is_high_threshold_entity("DEPARTMENT OF HEALTH AND HUMAN SERVICES")
+        assert is_high_threshold_entity("NC DEPT OF HEALTH AND HUMAN SERVICE")
+        assert is_high_threshold_entity("CAMDEN COUNTY PARTNERSHIP FOR CHILDREN")
+        assert is_high_threshold_entity("HENNEPIN COUNTY")
+        assert is_high_threshold_entity("HARRIS COUNTY HOSPITAL DISTRICT")
+        assert is_high_threshold_entity("GRAND RIVER HOSPITAL DISTRICT")
+        assert is_high_threshold_entity("FRANKLIN PARISH HOSPITAL SERVICE DISTRICT NO1")
+
+    def test_detects_tribal_entities(self):
+        assert is_high_threshold_entity("ABSENTEE SHAWNEE TRIBAL HEALTH AUTHORITY, INC.")
+        assert is_high_threshold_entity("ALBUQUERQUE INDIAN HEALTH CENTER")
+        assert is_high_threshold_entity("CHEROKEE NATION")
+        assert is_high_threshold_entity("CONFEDERATED TRIBES OF WARM SPRINGS")
+
+    def test_not_high_threshold_for_regular_providers(self):
+        assert not is_high_threshold_entity("ACME MEDICAL SERVICES LLC")
+        assert not is_high_threshold_entity("DR JOHN SMITH")
+        assert not is_high_threshold_entity("KAISER FOUNDATION HOSPITALS")
+
+    def test_government_not_in_always_filter(self):
+        """Government/tribal entities should NOT be in the always-filter list."""
+        assert not is_known_legitimate_entity("STATE OF TENNESSEE")
+        assert not is_known_legitimate_entity("COUNTY OF LOS ANGELES")
+        assert not is_known_legitimate_entity("CHEROKEE NATION")
+        assert not is_known_legitimate_entity("DEPARTMENT OF HEALTH AND HUMAN SERVICES")
+
+
+class TestCovidEraAwareness:
+    """COVID-era signals are downgraded or skipped to prevent false positives."""
+
+    def test_is_covid_era_helper(self):
+        assert _is_covid_era("2020-03")
+        assert _is_covid_era("2020-06-15")
+        assert _is_covid_era("2021-12")
+        assert not _is_covid_era("2019-12")
+        assert not _is_covid_era("2022-01")
+        assert not _is_covid_era("2023-06")
+
+    def test_rapid_escalation_covid_downgraded(self, con):
+        results = signal_rapid_escalation(con)
+        covid_results = [r for r in results if r["evidence"].get("covid_era_flag")]
+        for r in covid_results:
+            assert r["severity"] == "low", (
+                f"COVID-era rapid_escalation should be severity 'low', got '{r['severity']}'"
+            )
+
+    def test_billing_monoculture_skips_covid_codes(self, con):
+        results = signal_billing_monoculture(con)
+        for r in results:
+            code = r["evidence"].get("dominant_hcpcs_code", "")
+            assert code not in COVID_HCPCS, (
+                f"Billing monoculture should skip COVID HCPCS code {code}"
+            )
+
+    def test_reimbursement_rate_skips_covid_codes(self, con):
+        results = signal_reimbursement_rate_anomaly(con)
+        for r in results:
+            code = r["evidence"].get("hcpcs_code", "")
+            assert code not in COVID_HCPCS, (
+                f"Reimbursement rate anomaly should skip COVID HCPCS code {code}"
+            )
+
+    def test_bust_out_covid_downgraded(self, con):
+        results = signal_billing_bust_out(con)
+        covid_results = [r for r in results if r["evidence"].get("covid_era_flag")]
+        for r in covid_results:
+            assert r["severity"] == "low", (
+                f"COVID-era bust-out should be severity 'low', got '{r['severity']}'"
+            )
+
+    def test_workforce_impossibility_covid_downgraded(self, con):
+        results = signal_workforce_impossibility(con)
+        covid_results = [r for r in results if r["evidence"].get("covid_era_flag")]
+        for r in covid_results:
+            assert r["severity"] == "low", (
+                f"COVID-era workforce impossibility should be severity 'low', got '{r['severity']}'"
+            )
+
+    def test_non_covid_signals_unchanged(self, con):
+        """Signals outside COVID window should not be affected."""
+        results = signal_rapid_escalation(con)
+        non_covid = [r for r in results if not r["evidence"].get("covid_era_flag")]
+        for r in non_covid:
+            assert r["severity"] in ("medium", "high"), (
+                f"Non-COVID rapid_escalation should be medium/high, got '{r['severity']}'"
+            )
